@@ -94,6 +94,24 @@ def entity_overlap_score(query_entities: set, memory_entities: set) -> float:
 
 # ─── Retrieval ────────────────────────────────────────────────────────────────
 
+def ann_search(store: SQLiteStore, query_embedding: list[float], k: int = 20) -> list[str]:
+    """ANN search via sqlite-vec. Returns memory IDs sorted by distance."""
+    if not store.vec_available or not store.count():
+        return []
+    import sqlite3, sqlite_vec
+    conn = sqlite3.connect(store.db_path)
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    vec_bytes = np.array(query_embedding, dtype=np.float32).tobytes()
+    rows = conn.execute(
+        "SELECT id, distance FROM vec_embeddings WHERE embedding MATCH ? "
+        "ORDER BY distance LIMIT ?",
+        (vec_bytes, k)
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
 def retrieve_relevant(
     query: str,
     store: SQLiteStore,
@@ -107,12 +125,23 @@ def retrieve_relevant(
     query_embedding = get_embedder().encode(query, normalize_embeddings=True).tolist()
     query_entities = set(extract_entities(query))
 
-    all_memories = store.get_all()
+    # Try ANN first, fall back to brute force
+    ann_ids = ann_search(store, query_embedding, k=k * 4)
+    if ann_ids:
+        all_memories = []
+        for mid in ann_ids:
+            mem = store.get(mid)
+            if mem:
+                if tag_filter and mem.tag != tag_filter:
+                    continue
+                all_memories.append(mem)
+    else:
+        all_memories = store.get_all()
+        if tag_filter:
+            all_memories = [m for m in all_memories if m.tag == tag_filter]
+
     if not all_memories:
         return []
-
-    if tag_filter:
-        all_memories = [m for m in all_memories if m.tag == tag_filter]
 
     scored = []
     for mem in all_memories:

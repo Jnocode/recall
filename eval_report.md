@@ -6,8 +6,8 @@ Memories: 33
 
 | Method | Avg Recall | Avg Precision |
 |--------|-----------|---------------|
-| Hybrid | 0.125 | 0.060 |
-| Pure Vector | 0.335 | 0.170 |
+| Hybrid | 0.385 | 0.200 |
+| Pure Vector | 0.389 | 0.200 |
+**Status: Hybrid ≈ Pure vector (baseline established). Improvement work in progress.**
 
-**Verdict: Hybrid > Pure? NO**
-**Improvement: 0.37x**
+
