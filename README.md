@@ -11,27 +11,81 @@ results = retrieve_relevant("How should I deploy?", store)
 # → "User prefers docker-compose over Dockerfile"
 ```
 
+## Prerequisites: Embedding Model
+
+recall. uses **nomic-embed-text-v1.5** (768-dim) running in LM Studio.
+No LLM — embedding models are tiny (~150MB), fast, and cost zero tokens.
+
+### 1. Install LM Studio
+
+Download from [lmstudio.ai](https://lmstudio.ai).
+
+### 2. Load the embedding model
+
+| Step | Screenshot / Cmd |
+|------|------------------|
+| Open LM Studio → **Models** tab | — |
+| Search `nomic-embed-text-v1.5` → Download | ~150MB |
+| Switch to **Local Inference Server** tab | — |
+| Select `nomic-embed-text-v1.5` in the model dropdown | — |
+| Click **Start Server** | port defaults to `1234` |
+| Verify it's working: | `curl http://127.0.0.1:1234/v1/models` |
+
+Expected response:
+```json
+{"object":"list","data":[{"id":"nomic-embed-text-v1.5","object":"model",...}]}
+```
+
+**That's it.** No API keys, no cloud services, no GPU required beyond what LM Studio needs (~2GB VRAM, also runs on CPU).
+
+### Port configuration
+
+Default port is `1234`. To change it, edit `src/recall/embed.py`:
+```python
+PORT = 1234  # change to match your LM Studio port
+```
+
+### If LM Studio is down
+
+`mcp_recall_recall` calls will fail with an embedding error.
+The rest of your agent (Honcho, built-in memory, session_search) is unaffected.
+
+---
+
 ## Quick start
 
-Requires [LM Studio](https://lmstudio.ai) with `nomic-embed-text-v1.5` loaded.
-
 ```bash
-pip install recall-memory
+pip install numpy
+pip install -e .
+
 recall add "User prefers docker-compose for local dev"
 recall query "How to deploy?"
 ```
 
-Or via MCP server for Antigravity IDE / Gemini CLI:
+Or via MCP server for Antigravity IDE / Hermes Agent / Gemini CLI:
 
 ```bash
-gemini mcp add recall "python" "path/to/recall_mcp.py"
+# Hermes: add to ~/.hermes/config.yaml
+# mcp_servers:
+#   recall:
+#     command: "python"
+#     args: ["path/to/src/recall/recall_mcp.py"]
+#     timeout: 30
 ```
 
-## How it works
+## Architecture
+
+```text
+store.py    — SQLite backend (memories, keywords, FTS5, vec_embeddings)
+embed.py    — Nomic Embed via LM Studio REST API (768-dim)
+retrieve.py — Three-path RRF retrieval
+cli.py      — Typer CLI (add / query / stats / delete)
+recall_mcp.py — MCP server for agent integration
+```
 
 Three parallel retrieval paths, fused via RRF (Reciprocal Rank Fusion):
 
-```
+```text
 Path V: Vector search (ANN) — sqlite-vec cosine similarity
 Path K: Keyword SQL JOIN — multi-hop keyword expansion
 Path F: FTS5 full-text search — porter tokenizer + unicode61
@@ -41,25 +95,28 @@ RRF → sorted top-5
 
 No LLM calls at query time. No vector database. Just SQLite.
 
-## Architecture
+## Installation
 
+### Dependencies
+
+| Dependency | Required? | Notes |
+|-----------|-----------|-------|
+| Python ≥3.10 | ✅ | — |
+| numpy | ✅ | Cosine similarity + vector ops |
+| sqlite-vec | ✅ | SQLite extension for ANN. Bundled as part of pip install. |
+| LM Studio (port 1234) | ✅ | Runs nomic-embed-text-v1.5. See Prerequisites above. |
+| sentence-transformers | ❌ | Not used. The actual embedding calls go through LM Studio's HTTP API. |
+
+```bash
+pip install numpy
+pip install -e .      # installs recall-memory package + pulls sqlite-vec
 ```
-store.py    — SQLite backend (memories, keywords, FTS5, vec_embeddings)
-embed.py    — Nomic Embed via LM Studio (768-dim)
-retrieve.py — Three-path RRF retrieval + MCP integration
-cli.py      — Typer CLI (add / query / stats / delete)
-recall_mcp.py — MCP server for agent integration
-```
 
-## Status
+### Verify installation
 
-Production-ready MVP. Tested against AIngram (tied on 1400 memories × 40 queries).
-
-```
-Memories: 1400 (from Honcho)
-Keywords: 10560
-Latency:  ~80ms/query
-Eval:     recall@5 comparable to AIngram with full extractor
+```bash
+recall stats
+# → Memories: 0  Keywords: 0
 ```
 
 ## CLI
@@ -72,6 +129,27 @@ recall stats                   # Store statistics
 recall delete <id>             # Remove a memory
 ```
 
+## MCP Tools (Hermes / Antigravity / Gemini)
+
+Three tools exposed via stdio MCP transport:
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `recall` | `query: str` (required), `k: int (default 5)` | `{memories: [...], count: int}` |
+| `store_memory` | `content: str` (required), `session_id: str`, `tag: str` | `{id: str, status: "stored"}` |
+| `memory_stats` | (none) | `{memories: int, keywords: int}` |
+
+## Status
+
+Production-ready MVP. Tested against AIngram (tied on 1400 memories × 40 queries).
+
+```text
+Memories: 1400 (from Honcho)
+Keywords: 10560
+Latency:  ~80ms/query
+Eval:     recall@5 comparable to AIngram with full extractor
+```
+
 ## Design decisions
 
 | Decision | Rationale |
@@ -79,7 +157,7 @@ recall delete <id>             # Remove a memory
 | Three-path RRF | ANN + SQL JOIN + FTS5 covers different failure modes |
 | No LLM re-rank | Extra latency + cost; not needed for retrieval quality |
 | SQLite first | Zero-deployment, portable, git-committable |
-| Nomic embed | 768-dim via LM Studio, better than MiniLM |
+| Nomic embed via LM Studio | 768-dim, better than MiniLM, no Python packaging hell |
 | RRF fusion | No weight tuning needed; standard IR technique |
 
 ## Comparison with AIngram
