@@ -1,18 +1,17 @@
 # recall. — Retrieval Layer
-# Pure vector search with domain vocabulary safety net.
-# Feynman verdict: hybrid ≈ pure, entity extraction ≈ noise.
+# Two-path retrieval: keyword SQL JOIN + pure vector search
+# Feynman-approved: no LLM, no hybrid scoring
 
 import re
 import numpy as np
-from datetime import datetime
 from typing import Optional
 
-from store import Memory, SQLiteStore
+from store import Memory, SQLiteStore, extract_keywords as extract_entities
 from embed import embed
 
 TOP_K = 10
 
-# ─── Domain vocabulary (safety net, not core) ─────────────────────────────────
+# ─── Domain vocabulary (safety net, kept per Feynman) ─────────────────────────
 DOMAIN_VOCAB = {
     "deploy": ["docker", "docker-compose", "container", "deployment"],
     "deployment": ["docker", "docker-compose", "deploy"],
@@ -49,37 +48,6 @@ def expand_query(query: str) -> str:
 
 
 # ─── ANN ──────────────────────────────────────────────────────────────────────
-# ─── Entity extraction (for display only) ────────────────────────────────────
-
-STOP_WORDS = {"the","a","an","is","are","was","were","it","this","that",
-    "to","of","in","for","on","with","at","by","from","as","and","or","but",
-    "not","be","been","being","have","has","had","do","does","did","will",
-    "would","can","could","may","might","shall","should","about","into",
-    "through","during","before","after","above","below","between","out",
-    "off","over","under","again","further","then","once","here","there",
-    "when","where","why","how","all","each","every","both","few","more",
-    "most","other","some","such","no","nor","only","own","same","so",
-    "than","too","very","just","also","now","get","use","set","put","make",
-    "take","come","go","see","know","think","want","give","tell","ask",
-    "show","try","leave","call","keep","let","begin","seem","help","turn",
-    "what","which","who","whom","whose","where","why","how"}
-
-def extract_entities(text: str) -> list[str]:
-    text_lower = text.lower()
-    multi_word = re.findall(r'\b[a-zA-Z][a-zA-Z0-9]+[-_][a-zA-Z0-9][-a-zA-Z0-9]*\b', text)
-    capitalized = re.findall(r'\b[A-Z][a-zA-Z0-9+#_-]{2,}\b', text)
-    versions = re.findall(r'\b[A-Za-z]+\s*\d+\.\d+[\w.]*\b', text)
-    camel_case = re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b', text)
-    words = re.findall(r'\b[a-zA-Z]{4,}\b', text_lower)
-    words = [w for w in words if w not in STOP_WORDS]
-    all_terms = set()
-    for term in multi_word + capitalized + versions + camel_case:
-        t = term.lower().rstrip('s')
-        if t not in STOP_WORDS:
-            all_terms.add(t)
-    for w in words:
-        all_terms.add(w)
-    return sorted(all_terms)[:15]
 
 def ann_search(store: SQLiteStore, query_embedding: list[float], k: int = 20) -> list[str]:
     if not store.vec_available or not store.count():
@@ -90,14 +58,14 @@ def ann_search(store: SQLiteStore, query_embedding: list[float], k: int = 20) ->
     sqlite_vec.load(conn)
     vec_bytes = np.array(query_embedding, dtype=np.float32).tobytes()
     rows = conn.execute(
-        "SELECT id, distance FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        "SELECT id FROM vec_embeddings WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
         (vec_bytes, k)
     ).fetchall()
     conn.close()
     return [r[0] for r in rows]
 
 
-# ─── Main retrieval (pure vector + domain vocab) ─────────────────────────────
+# ─── Two-path retrieval ───────────────────────────────────────────────────────
 
 def retrieve_relevant(
     query: str,
@@ -105,30 +73,43 @@ def retrieve_relevant(
     k: int = TOP_K,
     tag_filter: Optional[str] = None,
 ) -> list[Memory]:
-    # Apply domain vocab expansion
+    # Embed query (with domain vocab expansion as safety net)
     query_embedding = embed(expand_query(query))
 
-    # ANN first, fallback brute force
-    ann_ids = ann_search(store, query_embedding, k=k * 4)
-    if ann_ids:
-        all_memories = []
-        for mid in ann_ids:
+    # ── Path B: Direct vector search ──────────────────────────────────────────
+    vec_ids = set(ann_search(store, query_embedding, k=k * 2))
+
+    # ── Path A: Keyword SQL JOIN ──────────────────────────────────────────────
+    # Collect keywords from vector-matched memories
+    related_keywords = store.get_related_keywords(list(vec_ids), limit=10) if vec_ids else []
+
+    # SQL JOIN: find all memories that share these keywords
+    kw_ids = set(store.search_by_keywords(related_keywords, limit=k * 2))
+
+    # ── Combine both paths ────────────────────────────────────────────────────
+    combined_ids = vec_ids | kw_ids
+    if tag_filter:
+        combined_ids = {mid for mid in combined_ids
+                        if (mem := store.get(mid)) and mem.tag == tag_filter}
+
+    if not combined_ids:
+        # Fallback: brute force all memories
+        all_mems = store.get_all()
+        if tag_filter:
+            all_mems = [m for m in all_mems if m.tag == tag_filter]
+    else:
+        all_mems = []
+        for mid in combined_ids:
             mem = store.get(mid)
             if mem:
-                if tag_filter and mem.tag != tag_filter:
-                    continue
-                all_memories.append(mem)
-    else:
-        all_memories = store.get_all()
-        if tag_filter:
-            all_memories = [m for m in all_memories if m.tag == tag_filter]
+                all_mems.append(mem)
 
-    if not all_memories:
+    if not all_mems:
         return []
 
     # Rank by cosine similarity
     scored = []
-    for mem in all_memories:
+    for mem in all_mems:
         if mem.embedding:
             a, b = np.array(query_embedding), np.array(mem.embedding)
             sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
@@ -139,11 +120,11 @@ def retrieve_relevant(
 
 
 def pure_vector_search(query: str, store: SQLiteStore, k: int = TOP_K) -> list[Memory]:
-    """Pure vector search, no domain vocab expansion. For baseline comparison."""
+    """Pure vector search, no keyword expansion. For baseline comparison."""
     query_embedding = embed(query)
-    all_memories = store.get_all()
+    all_mems = store.get_all()
     scored = []
-    for mem in all_memories:
+    for mem in all_mems:
         if mem.embedding:
             a, b = np.array(query_embedding), np.array(mem.embedding)
             sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
