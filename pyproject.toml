@@ -11,10 +11,14 @@ license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
+    "typer>=0.9.0",
+    "sqlite-vec>=0.1.0",
 ]
 
 [project.optional-dependencies]
-mcp = []
+dev = [
+    "pytest>=7.0",
+]
 
 [project.urls]
 homepage = "https://github.com/Jnocode/recall-memory"

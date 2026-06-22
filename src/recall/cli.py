@@ -3,13 +3,14 @@
 import typer
 from datetime import datetime
 from .store import Memory, SQLiteStore
-from .retrieve import extract_entities, retrieve_relevant, pure_vector_search
+from .retrieve import retrieve_relevant
+from .config import DEFAULT_DB_PATH
 
 app = typer.Typer()
 store: SQLiteStore = None  # initialized lazily
 
 
-def get_store(db_path: str = "recall.db") -> SQLiteStore:
+def get_store(db_path: str = DEFAULT_DB_PATH) -> SQLiteStore:
     global store
     if store is None:
         store = SQLiteStore(db_path)
@@ -21,57 +22,35 @@ def add(
     content: str,
     session: str = "default",
     tag: str = "episodic",
-    db: str = "recall.db",
 ):
     """Add a memory to the store."""
-    s = get_store(db)
-    entities = extract_entities(content)
-    mem = Memory(content=content, entities=entities, session_id=session, tag=tag)
+    s = get_store()
+    mem = Memory(content=content, session_id=session, tag=tag)
     mem_id = s.add(mem)
     typer.echo(f"✅ [{mem_id[:8]}] {content[:60]}...")
-    typer.echo(f"   Entities: {entities[:6]}")
 
 
 @app.command()
 def query(
-    query: str,
+    query_text: str = typer.Argument(..., help="What to search for"),
     k: int = 5,
-    db: str = "recall.db",
 ):
     """Query memories using hybrid scoring."""
-    s = get_store(db)
-    results = retrieve_relevant(query, s, k=k)
-    typer.echo(f"\n🔍 Query: {query}")
+    s = get_store()
+    results = retrieve_relevant(query_text, s, k=k)
+    typer.echo(f"\n🔍 Query: {query_text}")
     typer.echo(f"{'─'*50}")
     for i, mem in enumerate(results, 1):
         ts = mem.timestamp.strftime("%m-%d")
         typer.echo(f"  {i}. [{ts}] [{mem.tag}] {mem.content[:80]}")
-        if mem.entities:
-            typer.echo(f"     entities: {mem.entities[:6]}")
     if not results:
         typer.echo("  (no results)")
 
 
 @app.command()
-def pure(
-    query: str,
-    k: int = 5,
-    db: str = "recall.db",
-):
-    """Query using pure vector search (baseline)."""
-    s = get_store(db)
-    results = pure_vector_search(query, s, k=k)
-    typer.echo(f"\n🔍 Query (pure vector): {query}")
-    typer.echo(f"{'─'*50}")
-    for i, mem in enumerate(results, 1):
-        ts = mem.timestamp.strftime("%m-%d")
-        typer.echo(f"  {i}. [{ts}] [{mem.tag}] {mem.content[:80]}")
-
-
-@app.command()
-def stats(db: str = "recall.db"):
+def stats():
     """Show store statistics."""
-    s = get_store(db)
+    s = get_store()
     total = s.count()
     episodic = s.count(tag="episodic")
     semantic = s.count(tag="semantic")
@@ -87,11 +66,10 @@ def stats(db: str = "recall.db"):
 
 @app.command()
 def delete(
-    memory_id: str,
-    db: str = "recall.db",
+    memory_id: str = typer.Argument(..., help="Memory ID to delete"),
 ):
     """Delete a memory by ID."""
-    s = get_store(db)
+    s = get_store()
     if s.delete(memory_id):
         typer.echo(f"🗑️  Deleted {memory_id}")
     else:
@@ -99,10 +77,10 @@ def delete(
 
 
 @app.command()
-def clear(db: str = "recall.db"):
+def clear():
     """Clear ALL memories."""
     typer.confirm("Delete all memories?", abort=True)
-    s = get_store(db)
+    s = get_store()
     s.clear()
     typer.echo("🗑️  All memories cleared.")
 

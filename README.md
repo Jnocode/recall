@@ -40,9 +40,9 @@ Expected response:
 
 ### Port configuration
 
-Default port is `1234`. To change it, edit `src/recall/embed.py`:
+Default port is `1234`. To change it, set `EMBED_PORT` in `src/recall/embed.py`:
 ```python
-PORT = 1234  # change to match your LM Studio port
+EMBED_PORT = 1234  # change to match your LM Studio port
 ```
 
 ### If LM Studio is down
@@ -103,8 +103,10 @@ No LLM calls at query time. No vector database. Just SQLite.
 |-----------|-----------|-------|
 | Python ≥3.10 | ✅ | — |
 | numpy | ✅ | Cosine similarity + vector ops |
-| sqlite-vec | ✅ | SQLite extension for ANN. Bundled as part of pip install. |
+| typer | ✅ | CLI interface |
+| sqlite-vec | ✅ | SQLite extension for ANN |
 | LM Studio (port 1234) | ✅ | Runs nomic-embed-text-v1.5. See Prerequisites above. |
+| pytest | ❌ | Only needed for development (`pip install -e ".[dev]"`) |
 | sentence-transformers | ❌ | Not used. The actual embedding calls go through LM Studio's HTTP API. |
 
 ```bash

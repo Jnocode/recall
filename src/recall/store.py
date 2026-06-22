@@ -6,7 +6,7 @@ import json
 import hashlib
 import re
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -16,7 +16,7 @@ class Memory:
     content: str
     id: str = ""
     entities: list[str] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     embedding: Optional[list[float]] = None
     access_count: int = 0
     session_id: str = ""
@@ -68,6 +68,7 @@ class SQLiteStore:
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
         conn.enable_load_extension(True)
+        conn.execute("PRAGMA journal_mode=WAL")
         try:
             import sqlite_vec
             sqlite_vec.load(conn)

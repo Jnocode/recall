@@ -1,6 +1,7 @@
 # recall. — Retrieval Layer
-# Two-path retrieval: keyword SQL JOIN + pure vector search
-# Feynman-approved: no LLM, no hybrid scoring
+# Three-path RRF retrieval: ANN + keyword SQL JOIN + FTS5.
+# Gracefully degrades to 2-path (keyword + FTS5) when LM Studio is unavailable.
+# No LLM at query time.
 
 import re
 import numpy as np
@@ -65,7 +66,7 @@ def ann_search(store: SQLiteStore, query_embedding: list[float], k: int = 20) ->
     return [r[0] for r in rows]
 
 
-# ─── Two-path retrieval ───────────────────────────────────────────────────────
+# ─── Three-path retrieval (degrades gracefully) ───────────────────────────────
 
 def retrieve_relevant(
     query: str,
@@ -74,18 +75,36 @@ def retrieve_relevant(
     tag_filter: Optional[str] = None,
     hops: int = 2,
 ) -> list[Memory]:
-    query_embedding = embed(expand_query(query, max_terms=20))
+    """Three-path RRF retrieval.
 
-    # Three retrieval paths (fused via RRF)
-    path_results = {}
+    Path V: Vector search (ANN) via sqlite-vec
+    Path K: Keyword SQL JOIN with multi-hop expansion
+    Path F: FTS5 full-text search
 
-    # Path V: Vector search (ANN)
-    vec_ids = ann_search(store, query_embedding, k=k * 3)
-    for rank, mid in enumerate(vec_ids):
-        path_results[mid] = path_results.get(mid, 0.0) + 1.0 / (60 + rank)
+    If LM Studio (embedding) is unavailable, Path V is skipped and the
+    system falls back to 2-path retrieval (keyword + FTS5).
+    """
+    # Try to embed the expanded query; if unavailable, skip ANN paths
+    expanded = expand_query(query, max_terms=20)
+    query_embedding = embed(expanded) if expand_query(query, max_terms=20) else None
+    embed_available = query_embedding is not None
+
+    if not embed_available:
+        # Graceful degradation: try bare query (no expansion) as fallback
+        query_embedding = embed(query)
+
+    path_results: dict[str, float] = {}
+
+    # Path V: Vector search (ANN) — only if embedding is available
+    if query_embedding is not None:
+        vec_ids = ann_search(store, query_embedding, k=k * 3)
+        for rank, mid in enumerate(vec_ids):
+            path_results[mid] = path_results.get(mid, 0.0) + 1.0 / (60 + rank)
 
     # Path K: Keyword SQL JOIN (multi-hop)
-    seed_ids = list(set(vec_ids))
+    seed_ids = list(set(
+        mid for mid in path_results.keys()
+    )) if path_results else []
     kw_ids = set(seed_ids)
     kw_rank = 0
     for hop in range(hops):
@@ -100,57 +119,53 @@ def retrieve_relevant(
         if not added or hop >= hops - 1:
             break
 
-    # Path F: FTS5 full-text search (from AIngram)
+    # Path F: FTS5 full-text search
     fts_ids = store.fts_search(query, limit=k * 3)
     for rank, mid in enumerate(fts_ids):
         path_results[mid] = path_results.get(mid, 0.0) + 1.0 / (60 + rank)
 
     # Query keywords also contribute to keyword path
-    query_kws = list(set(expand_query(query, max_terms=20).split()[:10]))
+    query_kws = list(set(expanded.split()[:10]))
     qkw_ids = store.search_by_keywords(query_kws, limit=k * 3)
     for rank, mid in enumerate(qkw_ids):
         path_results[mid] = path_results.get(mid, 0.0) + 1.0 / (60 + rank)
 
-    # Filter and fetch
+    # Filter by tag
     if tag_filter:
-        path_results = {mid: sc for mid, sc in path_results.items()
-                        if (mem := store.get(mid)) and mem.tag == tag_filter}
+        path_results = {
+            mid: sc for mid, sc in path_results.items()
+            if (mem := store.get(mid)) and mem.tag == tag_filter
+        }
 
     if not path_results:
         all_mems = store.get_all()
         if tag_filter:
             all_mems = [m for m in all_mems if m.tag == tag_filter]
+        return _rank_by_embedding(all_mems, query_embedding, k) if all_mems else []
     else:
-        # Sort by RRF score, then by cosine similarity for tiebreaking
         scored = []
         for mid, rrf_score in path_results.items():
             mem = store.get(mid)
-            if mem and mem.embedding:
+            if mem and mem.embedding and query_embedding is not None:
                 a, b = np.array(query_embedding), np.array(mem.embedding)
                 sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
                 scored.append((rrf_score * 0.7 + sim * 0.3, mem))
+            elif mem:
+                scored.append((rrf_score, mem))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [mem for _, mem in scored[:k]]
 
-    if not all_mems:
-        return []
 
+def _rank_by_embedding(
+    memories: list[Memory],
+    query_embedding: list[float] | None,
+    k: int,
+) -> list[Memory]:
+    """Fallback ranking when no RRF results exist. Sorts by cosine similarity."""
+    if query_embedding is None:
+        return memories[:k]
     scored = []
-    for mem in all_mems:
-        if mem.embedding:
-            a, b = np.array(query_embedding), np.array(mem.embedding)
-            sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
-            scored.append((sim, mem))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [mem for _, mem in scored[:k]]
-
-
-def pure_vector_search(query: str, store: SQLiteStore, k: int = TOP_K) -> list[Memory]:
-    """Pure vector search, no keyword expansion. For baseline comparison."""
-    query_embedding = embed(query)
-    all_mems = store.get_all()
-    scored = []
-    for mem in all_mems:
+    for mem in memories:
         if mem.embedding:
             a, b = np.array(query_embedding), np.array(mem.embedding)
             sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))

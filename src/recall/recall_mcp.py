@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
-"""recall. MCP Server for Gemini CLI
+"""recall. MCP Server
 
-Provides memory retrieval/storage as MCP tools.
-Gemini CLI usage: gemini mcp add recall "python" "path/to/recall_mcp.py"
+Provides memory retrieval/storage as MCP tools via stdio transport.
+Usage: python -m recall.recall_mcp
+   or: gemini mcp add recall "python" "path/to/src/recall/recall_mcp.py"
 """
 
 import sys, json, os, sqlite3
+from datetime import datetime, timezone
 
-# Add recall to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from embed import embed
-
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recall_p0.db")
+# Package-relative imports (works when installed or run as -m)
+from .embed import embed
+from .store import SQLiteStore, Memory
+from .retrieve import retrieve_relevant
+from .config import DEFAULT_DB_PATH
 
 
 def get_store():
     """Lazy-init store for each request."""
-    from store import SQLiteStore
-    store = SQLiteStore(DB_PATH, vec_dim=768)
-    return store
+    return SQLiteStore(DEFAULT_DB_PATH, vec_dim=768)
 
 
 # ─── MCP tool implementations ─────────────────────────────────────────────────
 
 def tool_recall(query: str, k: int = 5) -> dict:
     """Retrieve relevant memories for a query."""
-    from retrieve import retrieve_relevant
     store = get_store()
     mems = retrieve_relevant(query, store, k=k)
     results = []
@@ -42,11 +41,9 @@ def tool_recall(query: str, k: int = 5) -> dict:
 
 def tool_store(content: str, session_id: str = "", tag: str = "episodic") -> dict:
     """Store a memory with auto-keyword indexing."""
-    from store import Memory
-    from datetime import datetime
     store = get_store()
     mem = Memory(content=content, session_id=session_id, tag=tag,
-                 timestamp=datetime.utcnow(), embedding=embed(content))
+                 timestamp=datetime.now(timezone.utc), embedding=embed(content))
     mid = store.add(mem)
     return {"id": mid, "status": "stored"}
 
@@ -54,7 +51,7 @@ def tool_store(content: str, session_id: str = "", tag: str = "episodic") -> dic
 def tool_stats() -> dict:
     """Get memory store statistics."""
     store = get_store()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DEFAULT_DB_PATH)
     kw_count = conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
     conn.close()
     return {
@@ -103,48 +100,38 @@ TOOLS = {
 
 # ─── MCP Stdio Transport ──────────────────────────────────────────────────────
 
-def handle_request(request: dict) -> dict:
+def handle_request(request: dict) -> dict | None:
     """Process a single MCP JSON-RPC request."""
     req_id = request.get("id")
     method = request.get("method", "")
 
-    # Initialize
     if method == "initialize":
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {
-                        "listChanged": False
-                    }
-                },
-                "serverInfo": {
-                    "name": "recall-mcp",
-                    "version": "1.0.0"
-                }
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "recall-mcp", "version": "1.0.0"}
             }
         }
 
-    # List tools
+    if method == "notifications/initialized":
+        return None  # no-op, ready to serve
+
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
                 "tools": [
-                    {
-                        "name": name,
-                        "description": info["description"],
-                        "inputSchema": info["input_schema"]
-                    }
+                    {"name": name, "description": info["description"],
+                     "inputSchema": info["input_schema"]}
                     for name, info in TOOLS.items()
                 ]
             }
         }
 
-    # Call tool
     if method == "tools/call":
         params = request.get("params", {})
         tool_name = params.get("name", "")
@@ -169,7 +156,6 @@ def handle_request(request: dict) -> dict:
             "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
         }
 
-    # Notifications (no response needed)
     if method.startswith("notifications/"):
         return None
 
@@ -181,16 +167,11 @@ def handle_request(request: dict) -> dict:
 
 
 if __name__ == "__main__":
-    # Read single request from stdin, process, output response
-    # Gemini CLI uses stdio transport
-    import select
-    # Check if we're in stdio mode (Gemini MCP launches us)
     if sys.stdin.isatty():
         print("recall. MCP Server")
-        print("Use: gemini mcp add recall python \"{}\"".format(__file__))
+        print("Run via: python -m recall.recall_mcp")
         sys.exit(0)
 
-    # MCP stdio mode
     while True:
         try:
             line = sys.stdin.readline()
