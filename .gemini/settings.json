@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "recall": {
+      "command": "python",
+      "args": [
+        "D:\\Workspace\\03_Dev_Projects\\recall\\recall_mcp.py"
+      ]
+    }
+  }
+}

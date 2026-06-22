@@ -37,12 +37,12 @@ DOMAIN_VOCAB = {
 }
 
 
-def expand_query(query: str) -> str:
+def expand_query(query: str, max_terms: int = 10) -> str:
     words = query.lower().split()
     expanded = set(words)
     for w in words:
         clean = w.rstrip("?.,!;:'\"s")
-        if clean in DOMAIN_VOCAB:
+        if clean in DOMAIN_VOCAB and len(expanded) < max_terms:
             expanded.update(DOMAIN_VOCAB[clean])
     return " ".join(expanded)
 
@@ -72,28 +72,50 @@ def retrieve_relevant(
     store: SQLiteStore,
     k: int = TOP_K,
     tag_filter: Optional[str] = None,
+    weights: Optional[dict] = None,
+    hops: int = 2,
 ) -> list[Memory]:
-    # Embed query (with domain vocab expansion as safety net)
-    query_embedding = embed(expand_query(query))
+    if weights is None:
+        weights = {"path_a": 0.4, "path_b": 0.6}
 
-    # ── Path B: Direct vector search ──────────────────────────────────────────
-    vec_ids = set(ann_search(store, query_embedding, k=k * 2))
+    query_embedding = embed(expand_query(query, max_terms=20))
 
-    # ── Path A: Keyword SQL JOIN ──────────────────────────────────────────────
-    # Collect keywords from vector-matched memories
-    related_keywords = store.get_related_keywords(list(vec_ids), limit=10) if vec_ids else []
+    # Path B: Direct vector search
+    vec_ids = set(ann_search(store, query_embedding, k=k * 3))
 
-    # SQL JOIN: find all memories that share these keywords
-    kw_ids = set(store.search_by_keywords(related_keywords, limit=k * 2))
+    # Path A: Multi-hop keyword SQL JOIN (SAG-style)
+    # Step 1: Extract keywords from query directly
+    query_keywords = list(set(expand_query(query, max_terms=20).split()[:10]))
+    query_kw_ids = set(store.search_by_keywords(query_keywords, limit=k * 3))
 
-    # ── Combine both paths ────────────────────────────────────────────────────
-    combined_ids = vec_ids | kw_ids
+    # Step 2: Also get keywords from vector-matched memories
+    seed_ids = list(vec_ids | query_kw_ids)
+    kw_ids = set(seed_ids)
+
+    for hop in range(hops):
+        related_keywords = store.get_related_keywords(seed_ids, limit=15) if seed_ids else []
+        new_ids = set(store.search_by_keywords(related_keywords, limit=k * 3))
+        added = new_ids - kw_ids
+        kw_ids.update(new_ids)
+        seed_ids = list(added)
+        if not added or hop >= hops - 1:
+            break
+
+    # Weighted fusion
+    combined_ids = {}
+    for mid in vec_ids:
+        combined_ids[mid] = weights["path_b"]
+    for mid in kw_ids:
+        current = combined_ids.get(mid, 0.0)
+        combined_ids[mid] = max(current, weights["path_a"])
+    for mid in vec_ids & kw_ids:
+        combined_ids[mid] = weights["path_a"] + weights["path_b"]
+
     if tag_filter:
-        combined_ids = {mid for mid in combined_ids
+        combined_ids = {mid: w for mid, w in combined_ids.items()
                         if (mem := store.get(mid)) and mem.tag == tag_filter}
 
     if not combined_ids:
-        # Fallback: brute force all memories
         all_mems = store.get_all()
         if tag_filter:
             all_mems = [m for m in all_mems if m.tag == tag_filter]
@@ -107,13 +129,14 @@ def retrieve_relevant(
     if not all_mems:
         return []
 
-    # Rank by cosine similarity
+    # Rank by cosine similarity × path weight
     scored = []
     for mem in all_mems:
         if mem.embedding:
             a, b = np.array(query_embedding), np.array(mem.embedding)
             sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
-            scored.append((sim, mem))
+            weight = combined_ids.get(mem.id, 0.5)
+            scored.append((sim * weight, mem))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [mem for _, mem in scored[:k]]
