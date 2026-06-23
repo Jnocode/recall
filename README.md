@@ -170,12 +170,14 @@ recall stats
 # → Memories: 0  Keywords: 0
 ```
 
-## CLI
+## Usage
+
+### CLI
 
 ```bash
 recall add "content"           # Store a memory
 recall query "question"        # Retrieve relevant memories (tiered)
-recall query "question" --include-cold  # Search cold tier too
+recall query "question" --include-cold  # Force search cold tier too
 recall stats                   # Store statistics
 recall stats --verbose         # + tier distribution
 recall gc --dry-run            # Preview eviction candidates
@@ -183,9 +185,7 @@ recall gc                      # Run garbage collection
 recall delete <id>             # Remove a memory
 ```
 
-## MCP Tools (Hermes / Antigravity / Gemini)
-
-Three tools exposed via stdio MCP transport:
+### MCP Tools (Hermes / Antigravity / Gemini)
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
@@ -193,6 +193,43 @@ Three tools exposed via stdio MCP transport:
 | `store_memory` | `content: str` (required), `session_id: str`, `tag: str` | `{id: str, status: "stored"}` |
 | `memory_stats` | (none) | `{memories: int, keywords: int, tiers: {hot, warm, cold}}` |
 | `gc_memory` | `dry_run: bool (default false)` | `{evicted/ candidates: int, db_size_mb: float}` |
+
+### Tiered Storage — How It Works
+
+v0.2.0 introduced tiered storage to reduce compute and memory.
+Here's what happens under the hood — you don't need to configure anything.
+
+**Query flow:**
+```
+You: recall query "docker compose"
+  → Hot tier (3-path RRF: ANN + keywords + FTS5)     ← ~500 fastest memories
+  → Warm tier (2-path RRF: keywords + FTS5 only)     ← ~5000 fallback
+  → Cold tier (keywords + FTS5, promoted on hit)      ← everything else
+  → Results returned
+```
+
+- **Hot**: memories with vector embeddings. ANN search runs here. ~80ms.
+- **Warm**: no vectors, but keyword + FTS5 still work. Slightly lower relevance.
+- **Cold**: doesn't participate in normal queries. Only used if hot+warm results are insufficient.
+
+**Promotion/demotion happens automatically:**
+- A memory you frequently query gets promoted to higher tiers
+- Unused memories gradually shift to lower tiers over time
+- Cold tier is sampled every 20 queries — if a cold memory's keywords match your query, it gets promoted back to warm
+
+**When to use `--include-cold`:**
+If you're searching for something very old or obscure that didn't appear in results, add this flag to force a full scan.
+
+**When to run `gc`:**
+Never, unless you care about disk space. Auto-triggers at 80MB DB size.
+`recall gc --dry-run` previews what would be deleted.
+`recall gc` actually deletes low-score memories (score < 0.5, rarely accessed).
+
+**What tiered storage does NOT change:**
+- Query syntax is identical
+- No configuration files to edit
+- No cron jobs or background processes
+- Schema migration is automatic on `pip install --upgrade`
 
 ## Status
 
