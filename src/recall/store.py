@@ -194,7 +194,7 @@ class SQLiteStore:
         finally:
             conn.close()
         # Check capacity after insert
-        self._gc_if_needed()
+        self._manage_tiers()
         return memory.id
 
     def get(self, memory_id: str) -> Optional[Memory]:
@@ -378,6 +378,30 @@ class SQLiteStore:
             conn.commit()
         finally:
             conn.close()
+
+    def trim_hot(self):
+        """Demote lowest-access-count hot memories to warm when over capacity."""
+        hot_count = self.count_tier("hot")
+        if hot_count <= HOT_CAPACITY:
+            return 0
+        excess = hot_count - HOT_CAPACITY
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            """SELECT id FROM memories WHERE tier='hot'
+               ORDER BY access_count ASC, timestamp ASC LIMIT ?""",
+            (excess,)).fetchall()
+        conn.close()
+        demoted = 0
+        for (mid,) in rows:
+            if self.demote(mid, "warm"):
+                demoted += 1
+        return demoted
+
+    def _manage_tiers(self):
+        """Run tier management after write: trim hot, replenish hot, check GC."""
+        self.trim_hot()
+        self.replenish_hot()
+        self._gc_if_needed()
 
     def _insert_vec_embedding(self, memory_id: str, embedding: list[float]):
         """Insert or replace a vector embedding in the vec_embeddings table."""

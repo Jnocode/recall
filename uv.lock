@@ -314,7 +314,7 @@ wheels = [
 ]
 
 [[package]]
-name = "recall-memory"
+name = "recall-sqlite"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
